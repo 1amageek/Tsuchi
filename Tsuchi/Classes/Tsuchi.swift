@@ -10,13 +10,41 @@ import UIKit
 import UserNotifications
 import FirebaseMessaging
 
-public class Tsuchi<T: PushNotificationProtocol>: NSObject, UNUserNotificationCenterDelegate, MessagingDelegate {
-    public var didRefreshRegistrationTokenActionBlock: ((String) -> Void)?
-    public var didReceiveRemoteNotificationActionBlock: ((T) -> Void)?
-    public var didOpenApplicationFromNotificationActionBlock: ((T) -> Void)?
-    public var isShowingBanner: Bool = false
+public class Tsuchi: NSObject {
+    private struct Container<T: PushNotificationPayload>: SubscribeContainer {
+        let handler: (Result<(T, NotificationMode), Error>) -> Void
 
-    public override init() {
+        func parse(_ json: [AnyHashable: Any], mode: NotificationMode) {
+            do {
+                let data = try JSONSerialization.data(withJSONObject: json, options: .prettyPrinted)
+                let notification = try JSONDecoder().decode(T.self, from: data)
+                handler(.success((notification, mode)))
+            } catch let error {
+                handler(.failure(error))
+            }
+        }
+    }
+
+    private struct AnyContainer: SubscribeContainer {
+        let base: SubscribeContainer
+
+        func parse(_ json: [AnyHashable: Any], mode: NotificationMode) {
+            base.parse(json, mode: mode)
+        }
+    }
+
+    public static let shared = Tsuchi()
+    private var container: AnyContainer?
+    public var didRefreshRegistrationTokenActionBlock: ((String) -> Void)?
+    @available(*, deprecated, message: "Use `notificationPresentationOptions` instead.")
+    public var showsNotificationBannerOnPresenting: Bool = true {
+        didSet {
+            notificationPresentationOptions = showsNotificationBannerOnPresenting ? [.alert, .badge, .sound] : [.badge, .sound]
+        }
+    }
+    public var notificationPresentationOptions: UNNotificationPresentationOptions = [.alert, .badge, .sound]
+
+    private override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
         Messaging.messaging().delegate = self
@@ -27,6 +55,10 @@ public class Tsuchi<T: PushNotificationProtocol>: NSObject, UNUserNotificationCe
     deinit {
         NotificationCenter.default.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.removeObserver(self, name: UIApplication.didEnterBackgroundNotification, object: nil)
+    }
+
+    public func subscribe<T: PushNotificationPayload>(_ type: T.Type, handler: @escaping (Result<(T, NotificationMode), Error>) -> Void) {
+        self.container = AnyContainer(base: Container<T>(handler: handler))
     }
 
     @objc func applicationDidBecomeActive(_ application: UIApplication) {
@@ -46,13 +78,19 @@ public class Tsuchi<T: PushNotificationProtocol>: NSObject, UNUserNotificationCe
     }
 
     public func register(completion: ((Bool) -> Void)?) {
-        if !UIApplication.shared.isRegisteredForRemoteNotifications {
-            requestAuthorization { (granted, _) in
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            if settings.authorizationStatus == .authorized {
+                completion?(true)
+                return
+            }
+            if settings.notificationCenterSetting == .enabled {
+                completion?(true)
+                return
+            }
+            self.requestAuthorization { (granted, _) in
                 completion?(granted)
             }
-            return
         }
-        completion?(true)
     }
 
     public func unregister(completion: (() -> Void)?) {
@@ -70,43 +108,35 @@ public class Tsuchi<T: PushNotificationProtocol>: NSObject, UNUserNotificationCe
         })
     }
 
-    //MARK: UNUserNotificationDelegate
+    public func subscribe(toTopic topic: TopicType) {
+        Messaging.messaging().subscribe(toTopic: topic.rawValue)
+    }
+
+    public func unsubscribe(fromTopic topic: TopicType) {
+        Messaging.messaging().unsubscribe(fromTopic: topic.rawValue)
+    }
+}
+
+extension Tsuchi: UNUserNotificationCenterDelegate {
     public func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         guard notification.request.trigger is UNPushNotificationTrigger else { completionHandler([]); return }
         let userInfo: [AnyHashable: Any] = notification.request.content.userInfo
         debugPrint("[Tsuchi] willPresent Message ID: \(userInfo["gcm.message_id"] as Any)")
         debugPrint("[Tsuchi] ", userInfo)
-        do {
-            let data = try JSONSerialization.data(withJSONObject: userInfo, options: .prettyPrinted)
-            let payload: T = try JSONDecoder().decode(T.self, from: data)
-            if isShowingBanner {
-                completionHandler([.alert, .badge, .sound])
-            } else {
-                completionHandler([.badge, .sound])
-            }
-            didReceiveRemoteNotificationActionBlock?(payload)
-        } catch let error {
-            print(error)
-        }
+        container?.base.parse(userInfo, mode: .willPresent)
+        completionHandler(notificationPresentationOptions)
     }
 
-    // open notification
     public func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         guard response.notification.request.trigger is UNPushNotificationTrigger else { completionHandler(); return }
         debugPrint("[Tsuchi] didReceive response ID: \(response)")
         let userInfo: [AnyHashable: Any] = response.notification.request.content.userInfo
-        do {
-            let data = try JSONSerialization.data(withJSONObject: userInfo, options: .prettyPrinted)
-            let payload: T = try JSONDecoder().decode(T.self, from: data)
-            completionHandler()
-            didOpenApplicationFromNotificationActionBlock?(payload)
-        } catch let error {
-            print(error)
-        }
-
+        container?.base.parse(userInfo, mode: .didReceive)
+        completionHandler()
     }
+}
 
-    //MARK: MessagingDelegate
+extension Tsuchi: MessagingDelegate {
     public func messaging(_ messaging: Messaging, didRefreshRegistrationToken fcmToken: String) {
         debugPrint("[Tsuchi] didRefreshRegistrationToken", fcmToken)
         connectToFcm()
@@ -120,10 +150,11 @@ public class Tsuchi<T: PushNotificationProtocol>: NSObject, UNUserNotificationCe
     }
 
     public func messaging(_ messaging: Messaging, didReceive remoteMessage: MessagingRemoteMessage) {
-        debugPrint(remoteMessage.appData, "hige")
+        debugPrint(remoteMessage.appData)
     }
 
     public func application(received remoteMessage: MessagingRemoteMessage) {
-        debugPrint(remoteMessage.appData, "hoge")
+        debugPrint(remoteMessage.appData)
     }
 }
+
